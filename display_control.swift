@@ -1,23 +1,27 @@
-// display_control.swift — 命令行断开 / 重连显示器（类似 BetterDisplay 的 Disconnect / Connect）
+// display_control.swift — Disconnect / reconnect displays from the command line
+// (similar to BetterDisplay's Disconnect / Connect).
 //
-// 编译:  swiftc -O display_control.swift -o display-control
-// 用法:
-//   display-control list                 实时扫描，列出显示器状态和当前可执行的操作
-//   display-control off [ID|builtin]     断开；不带参数时列出"可断开"的显示器供选择
-//   display-control on  [ID|all]         重连；不带参数时列出"可重连"的显示器供选择
+// Build:  swiftc -O display_control.swift -o display_control
+// Usage:
+//   display_control list                 Live scan: display states and available actions
+//   display_control off [ID|builtin]     Disconnect; without an argument, pick from a menu
+//   display_control on  [ID|all]         Reconnect;  without an argument, pick from a menu
 //
-// 设计要点:
-// · 每条命令都先实时扫描，只把当前真正可操作的显示器作为选项；
-//   只剩一个可用显示器时，不会出现任何可断开的选项。
-// · 唯一的改动是私有函数 CGSConfigureDisplayEnabled，范围 .forSession（注销 / 重启后系统复位）。
-// · 不需要后台进程：开盖、唤醒时 macOS 会重新检测显示器，被断开的显示器一般会自动回来。
-//   没回来时执行 `display-control on all`；完全没有画面时，合盖再开盖，或重启。
-// · 被断开的显示器可能从系统列表中彻底消失，所以把本工具断开的 ID 记在一个小文件里，
-//   仅用于"重连"时找回它。显示器恢复后记录自动清除，重启前的记录自动作废。
+// Notes (verified on Apple Silicon MacBook Air):
+// - No state file. Every command scans live and only offers displays that can be acted on;
+//   with a single usable display left, nothing can be disconnected.
+// - A disabled display drops out of the public online list but stays in the private
+//   CGSGetDisplayList, so "in CGSGetDisplayList but not online" means disconnected.
+// - The flag is set via the private CGSConfigureDisplayEnabled with .forSession scope:
+//   it survives lid close/open and unplug/replug, and is cleared only by `on`, logout or reboot.
+// - A disabled external display stays in CGSGetDisplayList after being unplugged, so IOKit is
+//   used to check whether it is still physically attached. (The built-in panel's IOKit entry
+//   disappears while disabled, so the built-in is always treated as attached.)
+// - Only IDs taken from the lists are ever queried: for unknown IDs, CGDisplayIsActive and
+//   friends return meaningless "true" values.
 
 import AppKit
-import CoreGraphics
-import Foundation
+import IOKit
 
 typealias DisplayID = CGDirectDisplayID
 
@@ -26,62 +30,92 @@ struct Failure: Error, CustomStringConvertible {
     init(_ d: String) { description = d }
 }
 
-// MARK: - 私有 API（唯一会改动显示器的地方）
+// MARK: - Private API
 
-// 社区逆向得到的声明（displayplacer 等项目使用）:
+// Reverse-engineered declarations (used by displayplacer et al.), verified on this machine:
 //   CGError CGSConfigureDisplayEnabled(CGDisplayConfigRef, CGDirectDisplayID, bool)
-// 第三个参数以 Int32 传 0/1：无论被调方按 bool 还是 int 读取，结果都一致。
+//   CGError CGSGetDisplayList(uint32_t max, CGDirectDisplayID *ids, uint32_t *count)
+// The bool is passed as Int32 0/1, which reads the same whether the callee expects bool or int.
 typealias ConfigureEnabledFn = @convention(c) (CGDisplayConfigRef?, DisplayID, Int32) -> Int32
+typealias ListFn = @convention(c) (UInt32, UnsafeMutablePointer<DisplayID>?, UnsafeMutablePointer<UInt32>?) -> Int32
 
-let configureEnabled: ConfigureEnabledFn? = {
-    let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)  // RTLD_DEFAULT：只查已加载的库
-    for name in ["CGSConfigureDisplayEnabled", "SLSConfigureDisplayEnabled"] {
-        if let sym = dlsym(rtldDefault, name) { return unsafeBitCast(sym, to: ConfigureEnabledFn.self) }
+func privateSymbol<T>(_ names: [String], as type: T.Type) -> T? {
+    let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)  // RTLD_DEFAULT: already-loaded images only
+    for name in names {
+        if let sym = dlsym(rtldDefault, name) { return unsafeBitCast(sym, to: type) }
     }
     return nil
-}()
+}
 
-let missingAPI = Failure("当前系统找不到 CGSConfigureDisplayEnabled，无法操作")
+let configureEnabled = privateSymbol(["CGSConfigureDisplayEnabled", "SLSConfigureDisplayEnabled"], as: ConfigureEnabledFn.self)
+let getAllDisplays = privateSymbol(["CGSGetDisplayList", "SLSGetDisplayList"], as: ListFn.self)
+let missingAPI = Failure("CGSConfigureDisplayEnabled not found on this system; cannot change displays")
 
+// The only function that changes display state.
 func configure(_ id: DisplayID, enabled: Bool) throws {
     guard let fn = configureEnabled else { throw missingAPI }
     var cfg: CGDisplayConfigRef?
-    guard CGBeginDisplayConfiguration(&cfg) == .success, let cfg else {
-        throw Failure("CGBeginDisplayConfiguration 失败")
-    }
+    guard CGBeginDisplayConfiguration(&cfg) == .success, let cfg else { throw Failure("CGBeginDisplayConfiguration failed") }
     let r = fn(cfg, id, enabled ? 1 : 0)
     guard r == CGError.success.rawValue else {
         CGCancelDisplayConfiguration(cfg)
-        throw Failure("ConfigureDisplayEnabled(\(id), \(enabled)) 返回 \(r)")
+        throw Failure("ConfigureDisplayEnabled(\(id), \(enabled)) returned \(r)")
     }
     let done = CGCompleteDisplayConfiguration(cfg, .forSession)
-    guard done == .success else { throw Failure("CGCompleteDisplayConfiguration 失败: \(done.rawValue)") }
+    guard done == .success else { throw Failure("CGCompleteDisplayConfiguration failed: \(done.rawValue)") }
 }
 
-// MARK: - 实时扫描
+// MARK: - Live scan
 
-func displayList(online: Bool) -> [DisplayID] {
+func displayList(_ get: (UInt32, UnsafeMutablePointer<DisplayID>, UnsafeMutablePointer<UInt32>) -> Int32) -> [DisplayID] {
     var ids = [DisplayID](repeating: 0, count: 32)
     var count: UInt32 = 0
-    let err = online ? CGGetOnlineDisplayList(32, &ids, &count) : CGGetActiveDisplayList(32, &ids, &count)
-    return err == .success ? Array(ids.prefix(Int(count))) : []
+    return get(32, &ids, &count) == 0 ? Array(ids.prefix(Int(min(count, 32)))) : []
 }
 
-// "已启用"= 活动，或处于镜像组（镜像中的从屏不在 active 列表里，但有画面）
+func activeDisplays() -> [DisplayID] { displayList { CGGetActiveDisplayList($0, $1, $2).rawValue } }
+func onlineDisplays() -> [DisplayID] { displayList { CGGetOnlineDisplayList($0, $1, $2).rawValue } }
+// Includes disconnected displays; falls back to the online list if the private symbol is missing.
+func allDisplays() -> [DisplayID] {
+    guard let fn = getAllDisplays else { return onlineDisplays() }
+    return displayList { fn($0, $1, $2) }
+}
+
+// Enabled = active, or online in a mirror set (hardware-mirrored secondaries are not "active").
 func isEnabled(_ id: DisplayID) -> Bool {
-    CGDisplayIsActive(id) != 0 || CGDisplayIsInMirrorSet(id) != 0
+    activeDisplays().contains(id) || (onlineDisplays().contains(id) && CGDisplayIsInMirrorSet(id) != 0)
 }
 
-struct Record: Codable {  // 本工具断开的显示器
+struct Panel {  // A display physically attached according to IOKit
+    let vendor, model: UInt32
     let name: String
-    let builtin: Bool
+}
+
+// Displays attached at the IOKit level (Apple Silicon). nil means "cannot tell".
+func attachedPanels() -> [Panel]? {
+    var iter: io_iterator_t = 0
+    guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOMobileFramebuffer"), &iter) == KERN_SUCCESS
+    else { return nil }
+    defer { IOObjectRelease(iter) }
+    var panels: [Panel] = []
+    var svc = IOIteratorNext(iter)
+    while svc != 0 {
+        let attrs = IORegistryEntryCreateCFProperty(svc, "DisplayAttributes" as CFString, kCFAllocatorDefault, 0)?
+            .takeRetainedValue() as? [String: Any]
+        if let p = attrs?["ProductAttributes"] as? [String: Any],
+           let vendor = p["LegacyManufacturerID"] as? NSNumber, let model = p["ProductID"] as? NSNumber {
+            panels.append(Panel(vendor: vendor.uint32Value, model: model.uint32Value, name: p["ProductName"] as? String ?? "Unnamed"))
+        }
+        IOObjectRelease(svc)
+        svc = IOIteratorNext(iter)
+    }
+    return panels.isEmpty ? nil : panels
 }
 
 struct Scan {
-    let active: [DisplayID]
-    let online: [DisplayID]
-    let names: [DisplayID: String]
-    let records: [DisplayID: Record]
+    let all, online, active: [DisplayID]
+    let names: [DisplayID: String]  // Only active displays have an NSScreen name
+    let panels: [Panel]?
 }
 
 func scan() -> Scan {
@@ -91,213 +125,167 @@ func scan() -> Scan {
             names[n.uint32Value] = screen.localizedName
         }
     }
-    // 已经恢复的显示器不再需要记录（无论是本工具、开盖还是系统恢复的）
-    var records = loadRecords()
-    let restored = records.keys.filter(isEnabled)
-    if !restored.isEmpty {
-        restored.forEach { records[$0] = nil }
-        try? saveRecords(records)  // 写不进去也无妨：下次扫描会再清理一次
-    }
-    return Scan(active: displayList(online: false), online: displayList(online: true),
-                names: names, records: records)
+    return Scan(all: allDisplays(), online: onlineDisplays(), active: activeDisplays(),
+                names: names, panels: attachedPanels())
 }
 
-// 可断开：活动、不在镜像组，且断开后至少还剩一个其他未休眠的活动显示器
+// Match an external display to IOKit by vendor + model (two identical monitors are indistinguishable).
+func panel(for id: DisplayID, _ s: Scan) -> Panel? {
+    s.panels?.first { $0.vendor == CGDisplayVendorNumber(id) && $0.model == CGDisplayModelNumber(id) }
+}
+
+// Built-in is always attached; if IOKit cannot tell, assume attached and let `on` report the result.
+func isAttached(_ id: DisplayID, _ s: Scan) -> Bool {
+    CGDisplayIsBuiltin(id) != 0 || s.panels == nil || panel(for: id, s) != nil
+}
+
+// Can disconnect: active, not mirrored, and at least one other awake active display remains.
 func offCandidates(_ s: Scan) -> [DisplayID] {
     s.active.filter { id in
         CGDisplayIsInMirrorSet(id) == 0 && s.active.contains { $0 != id && CGDisplayIsAsleep($0) == 0 }
     }
 }
 
-// 可重连：在线但未启用（且不是休眠）的显示器 + 本工具断开、尚未恢复的显示器
+// Can reconnect: known to the system, not online, and still physically attached.
 func onCandidates(_ s: Scan) -> [DisplayID] {
-    let disabled = s.online.filter { !isEnabled($0) && CGDisplayIsAsleep($0) == 0 }
-    return Set(disabled).union(s.records.keys).sorted()
-}
-
-func isBuiltin(_ id: DisplayID, _ s: Scan) -> Bool {
-    CGDisplayIsBuiltin(id) != 0 || s.records[id]?.builtin == true
+    s.all.filter { !s.online.contains($0) && isAttached($0, s) }.sorted()
 }
 
 func label(_ id: DisplayID, _ s: Scan) -> String {
-    let name = s.names[id] ?? s.records[id]?.name ?? "未命名"
-    return "[\(id)] \(name)" + (isBuiltin(id, s) ? "（内建）" : "")
+    if CGDisplayIsBuiltin(id) != 0 { return "[\(id)] \(s.names[id] ?? "Built-in Display") (built-in)" }
+    let name = s.names[id] ?? panel(for: id, s)?.name
+        ?? "External Display (vendor \(CGDisplayVendorNumber(id)), model \(CGDisplayModelNumber(id)))"
+    return "[\(id)] \(name)"
 }
 
 func status(_ id: DisplayID, _ s: Scan) -> String {
-    if isEnabled(id) { return CGDisplayIsInMirrorSet(id) != 0 ? "已连接（镜像）" : "已连接" }
-    if !s.online.contains(id) { return "已断开（系统已看不到它，也可能已拔出）" }
-    return CGDisplayIsAsleep(id) != 0 ? "休眠" : "已断开"
+    if !s.online.contains(id) { return isAttached(id, s) ? "disconnected" : "disconnected (cable unplugged; plug it back in to reconnect)" }
+    if isEnabled(id) { return CGDisplayIsInMirrorSet(id) != 0 ? "connected (mirrored)" : "connected" }
+    return CGDisplayIsAsleep(id) != 0 ? "asleep" : "online but not enabled"
 }
 
-// 等待条件成立，0.5 秒后再复核一次，避免把重新枚举过程中的瞬时状态当成结果
+// Wait up to 3 s for the condition, then re-check after 0.5 s so a transient state during
+// re-enumeration is not taken as the result. Running the run loop lets display-change
+// notifications be processed; if it has no sources it returns at once, so sleep instead.
 func waitStable(_ cond: () -> Bool) -> Bool {
+    func pause(_ t: Double) {
+        if CFRunLoopRunInMode(.defaultMode, t, false) == .finished { Thread.sleep(forTimeInterval: t) }
+    }
     let deadline = Date().addingTimeInterval(3)
     while !cond() {
         if Date() > deadline { return false }
-        pump(0.1)
+        pause(0.1)
     }
-    pump(0.5)
+    pause(0.5)
     return cond()
 }
 
-// 让 RunLoop 处理系统的显示器变更通知；没有事件源时退化为普通休眠
-func pump(_ seconds: Double) {
-    if CFRunLoopRunInMode(.defaultMode, seconds, false) == .finished { Thread.sleep(forTimeInterval: seconds) }
-}
-
-// MARK: - 记录文件
-
-let recordURL = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent("Library/Application Support/display-control/disabled.json")
-
-func bootDate() -> Date {
-    var tv = timeval()
-    var size = MemoryLayout<timeval>.size
-    sysctlbyname("kern.boottime", &tv, &size, nil, 0)
-    return Date(timeIntervalSince1970: Double(tv.tv_sec))
-}
-
-// 只认本次开机后写入的记录；读不到或解析失败都按"没有记录"处理（实时扫描才是依据）
-func loadRecords() -> [DisplayID: Record] {
-    guard let attrs = try? FileManager.default.attributesOfItem(atPath: recordURL.path),
-          let modified = attrs[.modificationDate] as? Date, modified > bootDate(),
-          let data = try? Data(contentsOf: recordURL),
-          let records = try? JSONDecoder().decode([DisplayID: Record].self, from: data)
-    else { return [:] }
-    return records
-}
-
-func saveRecords(_ records: [DisplayID: Record]) throws {
-    let fm = FileManager.default
-    if records.isEmpty {
-        if fm.fileExists(atPath: recordURL.path) { try fm.removeItem(at: recordURL) }
-        return
-    }
-    try fm.createDirectory(at: recordURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try JSONEncoder().encode(records).write(to: recordURL, options: .atomic)
-}
-
-// MARK: - 选择目标（只能从本次扫描得到的候选中选）
+// MARK: - Target selection (only from candidates found by the current scan)
 
 func pick(_ arg: String?, from candidates: [DisplayID], _ s: Scan, verb: String, none: String) throws -> DisplayID {
     guard !candidates.isEmpty else { throw Failure(none) }
-    let options = candidates.map { label($0, s) }.joined(separator: "、")
 
     if let arg {
-        let id: DisplayID? = arg == "builtin" ? candidates.first(where: { isBuiltin($0, s) }) : DisplayID(arg)
-        guard let id, candidates.contains(id) else { throw Failure("\(arg) 当前不能\(verb)。可选: \(options)") }
+        let id = arg == "builtin" ? candidates.first(where: { CGDisplayIsBuiltin($0) != 0 }) : DisplayID(arg)
+        guard let id, candidates.contains(id) else {
+            throw Failure("\(arg) cannot be \(verb) right now. Options: " + candidates.map { label($0, s) }.joined(separator: ", "))
+        }
         return id
     }
 
-    print("可\(verb)的显示器:")
+    print("Displays that can be \(verb):")
     for (i, id) in candidates.enumerated() { print("  \(i + 1). \(label(id, s))  \(status(id, s))") }
-    print("输入序号（直接回车取消）: ", terminator: "")
+    print("Enter a number (Enter to cancel): ", terminator: "")
     fflush(stdout)
     guard let line = readLine(), let n = Int(line.trimmingCharacters(in: .whitespaces)),
-          candidates.indices.contains(n - 1) else { throw Failure("已取消") }
+          candidates.indices.contains(n - 1) else { throw Failure("Cancelled") }
     return candidates[n - 1]
 }
 
-// MARK: - 命令
+// MARK: - Commands
 
 func cmdList() {
     let s = scan()
-    print("显示器（实时扫描）:")
-    for id in Set(s.online).union(s.records.keys).sorted() {
+    print("Displays (live scan):")
+    for id in s.all.sorted() {
         var line = "  \(label(id, s))  \(status(id, s))"
-        if CGDisplayIsActive(id) != 0 {
+        if s.active.contains(id) {
             line += "  \(CGDisplayPixelsWide(id))x\(CGDisplayPixelsHigh(id))"
-            if CGDisplayIsMain(id) != 0 { line += "  主显示器" }
+            if CGDisplayIsMain(id) != 0 { line += "  main" }
         }
         print(line)
     }
     let off = offCandidates(s).map { String($0) }, on = onCandidates(s).map { String($0) }
-    print("可断开: " + (off.isEmpty ? "无（至少保留一个可用显示器）" : off.joined(separator: ", ")))
-    print("可重连: " + (on.isEmpty ? "无" : on.joined(separator: ", ")))
+    print("Can disconnect: " + (off.isEmpty ? "none (at least one usable display must remain)" : off.joined(separator: ", ")))
+    print("Can reconnect:  " + (on.isEmpty ? "none" : on.joined(separator: ", ")))
+    if getAllDisplays == nil { print("Warning: CGSGetDisplayList not found; disconnected displays cannot be listed") }
 }
 
 func cmdOff(_ arg: String?) throws {
     let first = scan()
-    let target = try pick(arg, from: offCandidates(first), first, verb: "断开",
-                          none: "只剩一个可用显示器（镜像、休眠的不算），不能断开")
+    let target = try pick(arg, from: offCandidates(first), first, verb: "disconnected",
+                          none: "Only one usable display left (mirrored or asleep ones do not count); nothing can be disconnected")
 
-    // 交互选择期间情况可能已变：提交前重新扫描确认
+    // State may have changed while the menu was open: re-check right before committing.
     let s = scan()
-    guard offCandidates(s).contains(target) else { throw Failure("显示器状态已变化，请重新执行") }
-    if CGDisplayIsMain(target) != 0 { print("注意: 目标是主显示器，菜单栏会移到其他显示器") }
+    guard offCandidates(s).contains(target) else { throw Failure("Display state changed; please run the command again") }
+    if CGDisplayIsMain(target) != 0 { print("Note: this is the main display; the menu bar will move to another display") }
 
-    // 先记录再断开；记录写不进去就不动显示器
-    var records = s.records
-    records[target] = Record(name: s.names[target] ?? "未命名", builtin: isBuiltin(target, s))
-    try saveRecords(records)
+    do { try configure(target, enabled: false) } catch { print("Warning: \(error)") }
 
-    var configError: Error?
-    do { try configure(target, enabled: false) } catch { configError = error }
-
-    // 以实际状态为准：目标已断开，并且仍有其他未休眠的活动显示器
+    // Judge by actual state: target is gone and another awake active display remains.
     let gone = waitStable { !isEnabled(target) }
-    let othersOK = displayList(online: false).contains { $0 != target && CGDisplayIsAsleep($0) == 0 }
-    if gone && othersOK {
-        print("已断开 \(label(target, s))")
+    if gone && activeDisplays().contains(where: { $0 != target && CGDisplayIsAsleep($0) == 0 }) {
+        print("Disconnected \(label(target, s))")
         return
     }
 
-    // 失败：尽量恢复原状（残留记录会在下次扫描时自动清理）
+    // Failed: try to restore the original state.
     if !isEnabled(target) {
         try? configure(target, enabled: true)
         _ = waitStable { isEnabled(target) }
     }
-    let reason = gone ? "断开后没有其他可用显示器" : "断开未生效" + (configError.map { "（\($0)）" } ?? "")
-    throw Failure(reason + (isEnabled(target) ? "，已恢复原状" : "，且未能自动恢复：请合盖再开盖，或重启"))
+    throw Failure((gone ? "No other usable display after disconnecting" : "Disconnect did not take effect")
+                  + (isEnabled(target) ? "; original state restored" : "; automatic restore failed: log out or reboot"))
 }
 
 func cmdOn(_ arg: String?) throws {
     let s = scan()
     let candidates = onCandidates(s)
-    let targets: [DisplayID]
-    if arg == "all" {
-        guard !candidates.isEmpty else { print("没有需要重连的显示器"); return }
-        targets = candidates
-    } else {
-        targets = try [pick(arg, from: candidates, s, verb: "重连", none: "没有需要重连的显示器")]
-    }
+    if arg == "all" && candidates.isEmpty { print("No display to reconnect"); return }
+    let targets = try arg == "all" ? candidates
+        : [pick(arg, from: candidates, s, verb: "reconnected", none: "No display to reconnect")]
 
     var failed: [String] = []
     for id in targets {
-        do { try configure(id, enabled: true) } catch { print("警告: \(error)") }
-        if waitStable({ isEnabled(id) }) { print("已重连 \(label(id, s))") } else { failed.append(label(id, s)) }
+        do { try configure(id, enabled: true) } catch { print("Warning: \(error)") }
+        if waitStable({ isEnabled(id) }) { print("Reconnected \(label(id, s))") } else { failed.append(label(id, s)) }
     }
-    // 成功的记录无需手动删除：下次扫描时自动清理
-    if !failed.isEmpty {
-        throw Failure("未能重连 \(failed.joined(separator: "、"))。可尝试合盖再开盖、重新插拔，或注销 / 重启")
-    }
+    if !failed.isEmpty { throw Failure("Could not reconnect \(failed.joined(separator: ", ")). Try logging out or rebooting") }
 }
 
-// MARK: - 入口
+// MARK: - Entry point
 
 let usage = """
-用法:
-  display-control list                 列出显示器状态
-  display-control off [ID|builtin]     断开（不带参数则交互选择）
-  display-control on  [ID|all]         重连（不带参数则交互选择）
+Usage:
+  display_control list                 List displays and available actions
+  display_control off [ID|builtin]     Disconnect a display (menu if no argument)
+  display_control on  [ID|all]         Reconnect a display (menu if no argument)
 """
-
-guard getuid() != 0 else {
-    print("请以当前登录用户运行，不要使用 sudo")
-    exit(1)
-}
 
 let args = Array(CommandLine.arguments.dropFirst())
 let argTarget = args.count == 2 ? args[1] : nil
 do {
     switch (args.first ?? "list", args.count) {
     case ("list", 0...1): cmdList()
-    case ("off", 1...2):  guard configureEnabled != nil else { throw missingAPI }; try cmdOff(argTarget)
-    case ("on", 1...2):   guard configureEnabled != nil else { throw missingAPI }; try cmdOn(argTarget)
-    default:              print(usage); exit(2)
+    case ("off", 1...2), ("on", 1...2):
+        guard configureEnabled != nil else { throw missingAPI }  // Fail fast instead of a misleading verify timeout
+        try args[0] == "off" ? cmdOff(argTarget) : cmdOn(argTarget)
+    default:
+        print(usage)
+        exit(2)
     }
 } catch {
-    print("错误: \(error)")
+    print("Error: \(error)")
     exit(1)
 }
