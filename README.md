@@ -89,3 +89,8 @@ Prints events with timestamps as they happen: lid open and close, system sleep a
 ```
 
 Close and reopen the lid while it runs, then check `lid.log`.
+
+## Acknowledgement
+
+Supported by Claude Opus 5.5.
+
